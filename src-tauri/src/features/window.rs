@@ -29,6 +29,12 @@ pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         // Zoom is handled in chat.js instead, so the level can be persisted;
         // wry's built-in hotkeys would bypass that.
         .zoom_hotkeys_enabled(false)
+        // Tauri's own GTK drag controller must stay off: it consumes the drag
+        // before WebKit can synthesize the DOM drop event, and Chat's page
+        // never sees one -- measured, 118 dragover and 0 drop. This app
+        // listens to none of Tauri's DnD events, so nothing is given up. See
+        // the paste entry in Workarounds.md.
+        .disable_drag_drop_handler()
         .user_agent(&crate::features::user_agent::spoofed())
         .initialization_script(crate::inject::SCRIPT)
         .on_navigation(crate::features::external_links::navigation_guard)
@@ -51,6 +57,8 @@ pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
             // in chat.js.
             tauri::webview::PageLoadEvent::Finished => {
                 let _ = webview.eval(crate::inject::SCRIPT);
+                #[cfg(all(debug_assertions, target_os = "linux"))]
+                crate::features::paste_probe::install(&webview);
             }
         })
         .build()

@@ -3,14 +3,20 @@ pub mod accelerators;
 pub mod app_menu;
 pub mod autostart;
 pub mod badge;
+#[cfg(target_os = "linux")]
+pub mod clipboard;
 pub mod close_to_tray;
 pub mod connectivity;
 pub mod diagnostics;
+#[cfg(target_os = "linux")]
+pub mod dnd;
 pub mod downloads;
 pub mod external_links;
 #[cfg(target_os = "linux")]
 pub mod media;
 pub mod notifications;
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub mod paste_probe;
 pub mod reset;
 pub mod sign_in;
 pub mod tray;

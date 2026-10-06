@@ -67,6 +67,14 @@ tauri-plugin-notification = "2"
 # as mobile-only. Talking to the freedesktop daemon ourselves gets that back.
 [target.'cfg(target_os = "linux")'.dependencies]
 notify-rust = "4"
+# The paste replay needs the bytes of a copied file, which WebKitGTK never
+# delivers (see `features::clipboard_file`). base64 because the IPC is JSON.
+base64 = "0.22"
+# Reading the clipboard's uri-list is a GTK call, and spawn_blocking needs
+# tokio; both are already in the tree via Tauri, and the versions must be the
+# ones Tauri resolves. The app links GTK through tao either way.
+gtk = { version = "0.18", features = ["v3_24"] }
+tokio = { version = "1", features = ["rt", "sync", "fs", "io-util"] }
 # Declared only to enable its `ksni` feature: the default Linux tray backend
 # (libappindicator) delivers no click events, ksni does. The app never calls
 # tray-icon. See `features::tray` and Workarounds.md.

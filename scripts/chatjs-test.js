@@ -60,7 +60,8 @@ function load({
   onInvoke = () => Promise.resolve(),
   href,
   origin,
-  navigator = { platform: 'Linux x86_64' }
+  navigator = { platform: 'Linux x86_64' },
+  events = null
 } = {}) {
   const calls = [];
   const document = makeDocument(dom);
@@ -105,8 +106,20 @@ function load({
     showNotification: () => Promise.resolve(),
     getNotifications: () => Promise.resolve([])
   };
-  // The event bridge is optional; chat.js must survive its absence.
-  window.__TAURI__ = { event: null };
+  // The event bridge is optional; chat.js must survive its absence. `events`
+  // stands in for `__TAURI__.event` -- `listen` is how the drop replay hears
+  // about dropped files. Handlers are kept per event name, as the real bridge
+  // does: two listen calls must not clobber each other.
+  const eventHandlers = {};
+  window.eventHandlers = eventHandlers;
+  window.__TAURI__ = {
+    event: events || {
+      listen: (name, handler) => {
+        (eventHandlers[name] = eventHandlers[name] || []).push(handler);
+        return Promise.resolve(() => {});
+      }
+    }
+  };
 
   // In a browser the global object *is* window, so `X` and `window.X` are the
   // same thing. Model that rather than a separate globals bag, or the fakes
@@ -120,16 +133,22 @@ function load({
   // every link same-origin. Every webview has it.
   context.URL = URL;
 
-  // The image paste replay reads the platform, then builds a paste event of
-  // its own. These are the four web APIs it touches, cut down to what it uses.
+  // The paste replay reads the platform, then builds a paste event of its
+  // own. These are the web APIs it touches, cut down to what it uses. `atob`
+  // turns a command answer's base64 back into bytes.
   context.navigator = navigator;
+  context.atob = (b64) => Buffer.from(b64, 'base64').toString('binary');
   context.File = class File {
     constructor(parts, name, options) {
       this.parts = parts;
       this.name = name;
       this.type = options.type;
+      // Blob-like `size` for the log line. A Buffer has a real `length`.
+      this.size = parts.reduce((n, p) => n + (p.length || 0), 0);
     }
   };
+  // Drops replay at the element under the pointer.
+  document.elementFromPoint = dom.elementFromPoint || (() => null);
   context.DataTransfer = class DataTransfer {
     constructor() {
       this.files = [];
@@ -160,7 +179,7 @@ function load({
   };
 
   vm.runInContext(fs.readFileSync(SCRIPT, 'utf8'), context, { filename: 'chat.js' });
-  return { window, document, calls, drainFrames, tick: () => intervals.forEach((fn) => fn()) };
+  return { window, document, calls, eventHandlers, drainFrames, tick: () => intervals.forEach((fn) => fn()) };
 }
 
 /** Fire a listener chat.js registered on `window` rather than on `document`. */
@@ -759,13 +778,17 @@ async function rest() {
   }
 
   /*
-   * WebKitGTK hands Chat an empty paste event for an image; the replay reads
-   * the clipboard the async way and pastes again. What matters is that it
-   * fires only for that case, and only once.
+   * WebKitGTK hands Chat a paste event with no files for anything that is not
+   * text; the replay rebuilds the files and pastes again. What matters is that
+   * it fires only for that case, only once, and that a uri-list turns into
+   * files through the clipboard_file command -- with the command's refusals
+   * reported rather than retried.
    */
-  console.log('[9/9] image paste');
+  console.log('[9/9] paste replay');
   {
-    const png = { size: 623 };
+    // 623 bytes, as `Buffer.byteLength('x'.repeat(623))` -- the real blob's
+    // size, so the logged line can be compared exactly.
+    const png = Buffer.alloc(623);
     const clipboardWith = (items) => ({ read: () => Promise.resolve(items) });
     const imageItem = { types: ['image/png'], getType: () => Promise.resolve(png) };
 
@@ -777,7 +800,21 @@ async function rest() {
       };
       return t;
     };
-    const paste = (types, extra) => ({ isTrusted: true, clipboardData: { types }, ...extra });
+    // A DataTransfer shape: types, files, and getData for the string payloads.
+    const clipboardData = (types, extra = {}) => ({
+      types,
+      files: [],
+      getData: (type) => (extra.texts && extra.texts[type]) || '',
+      ...extra
+    });
+    const prevented = [];
+    const paste = (types, extra) => ({
+      isTrusted: true,
+      clipboardData: clipboardData(types, extra.cd || {}),
+      preventDefault: () => prevented.push('paste'),
+      stopPropagation: () => prevented.push('stop'),
+      ...extra
+    });
 
     {
       const box = target();
@@ -798,24 +835,201 @@ async function rest() {
       check('marks the replay cancelable, so Chat can claim it', !!replay && replay.cancelable === true);
 
       // The replay reaches the capture listener again in a real page. It is
-      // untrusted and not empty, and either is enough to leave it alone.
-      fire(document, 'paste', { ...replay, target: box });
+      // untrusted and carries files, and either is enough to leave it alone.
+      fire(document, 'paste', { ...replay, target: box, isTrusted: false });
       await settle();
       check('does not replay its own replay', box.received.length === 1);
 
-      const logged = calls.find((c) => c.command === 'page_log' && /image paste/.test(c.args.message));
+      const logged = calls.find((c) => c.command === 'page_log' && /file paste/.test(c.args.message));
       check('logs the size and type, never the content', !!logged &&
-        logged.args.message === 'image paste: replayed image/png, 623 bytes, handled=true',
+        logged.args.message === 'file paste: replayed image/png, 623 bytes, handled=true',
         logged && logged.args.message);
+    }
+
+    /* The command route: what the page asks for is answered by
+     * `clipboard_content` (what the clipboard holds) and `dropped_file` (what
+     * a drop carried). Stand-ins below; the refusals are what the real
+     * commands answer with. */
+    const VIDEO = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 1, 2, 3, 4]).toString('binary');
+    const b64 = (bin) => Buffer.from(bin, 'binary').toString('base64');
+    const contentCommand = (calls, content) => (command, args) => {
+      calls.push({ command, args });
+      if (command === 'clipboard_content') {
+        return content || { files: [], image: null };
+      }
+      if (command === 'dropped_file') {
+        if (args.token === 'drop-1') {
+          return { name: 'movie.webm', mime: 'video/webm', base64: b64(VIDEO) };
+        }
+        return Promise.reject(new Error('token is not the latest drop'));
+      }
+      return Promise.resolve();
+    };
+
+    {
+      /* A file-manager copy on Wayland: uri-list, no text/plain. The files
+       * come from clipboard_content; the original paste must be stopped. */
+      const box = target();
+      const calls = [];
+      const prevented = [];
+      const { document } = load({
+        navigator: { platform: 'Linux x86_64', clipboard: clipboardWith([]) },
+        onInvoke: contentCommand(calls, {
+          files: [{ name: 'movie.webm', mime: 'video/webm', base64: b64(VIDEO) }],
+          image: null
+        })
+      });
+      const event = paste(['text/uri-list'], { target: box });
+      const original = { ...event, preventDefault: () => prevented.push('paste') };
+      fire(document, 'paste', original);
+      await settle();
+      const replay = box.received[0];
+      check('replays a file-manager paste through clipboard_content',
+        box.received.length === 1, `${box.received.length} replays`);
+      check('hands Chat a webm with its real name and sniffed type',
+        !!replay && replay.clipboardData.files[0].name === 'movie.webm' &&
+          replay.clipboardData.files[0].type === 'video/webm' &&
+          replay.clipboardData.files[0].size === VIDEO.length);
+      check('stops the original paste, so Chat never sees the uri-list',
+        prevented.length === 1);
+      const asked = calls.find((c) => c.command === 'clipboard_content');
+      check('passes no path to the command', !!asked && Object.keys(asked.args).length === 0);
+    }
+    {
+      /* A copied image on Wayland: html that is only an <img>, no text. */
+      const box = target();
+      const calls = [];
+      const prevented = [];
+      const { document } = load({
+        navigator: { platform: 'Linux x86_64', clipboard: clipboardWith([]) },
+        onInvoke: contentCommand(calls, {
+          files: [],
+          image: { name: 'image.png', mime: 'image/png', base64: b64(png.toString('binary')) }
+        })
+      });
+      const event = paste(['text/html'], {
+        target: box,
+        cd: { texts: { 'text/html': '<img src="https://example.com/x.png">' } }
+      });
+      fire(document, 'paste', { ...event, preventDefault: () => prevented.push('paste') });
+      await settle();
+      check('replays a copied image pasted as html', box.received.length === 1 &&
+        box.received[0].clipboardData.files[0].type === 'image/png',
+        `${box.received.length} replays`);
+      check('stops the html paste Chat would have chased', prevented.length === 1);
+    }
+    {
+      /* Rich text (html + text/plain) is Chat's to handle, image or not. */
+      const box = target();
+      const calls = [];
+      const { document } = load({
+        navigator: { platform: 'Linux x86_64', clipboard: clipboardWith([]) },
+        onInvoke: contentCommand(calls, { files: [], image: null })
+      });
+      fire(document, 'paste', paste(['text/html', 'text/plain'], {
+        target: box,
+        cd: { texts: { 'text/html': '<b>hi</b>' } }
+      }));
+      await settle();
+      check('leaves a rich-text paste alone', box.received.length === 0 &&
+        !calls.some((c) => c.command === 'clipboard_content'));
+    }
+    {
+      /* A URL paste carries text/plain next to the uri-list. */
+      const box = target();
+      const calls = [];
+      const { document } = load({
+        navigator: { platform: 'Linux x86_64', clipboard: clipboardWith([]) },
+        onInvoke: contentCommand(calls, { files: [], image: null })
+      });
+      fire(document, 'paste', paste(['text/uri-list', 'text/plain'], { target: box }));
+      await settle();
+      check('leaves a pasted link alone', box.received.length === 0 &&
+        !calls.some((c) => c.command === 'clipboard_content'));
+    }
+    {
+      /* The command refuses; the refusal is logged, nothing replayed. */
+      const box = target();
+      const { document, calls } = load({
+        navigator: { platform: 'Linux x86_64', clipboard: clipboardWith([]) },
+        onInvoke: () => Promise.reject(new Error('not on a Chat page'))
+      });
+      fire(document, 'paste', paste(['text/uri-list'], { target: box }));
+      await settle();
+      const warned = calls.find((c) => c.command === 'page_log' && c.args.level === 'warn');
+      check('reports a refused read', box.received.length === 0 && !!warned &&
+        warned.args.message === 'file paste: clipboard refused: not on a Chat page',
+        warned && warned.args.message);
+    }
+    {
+      /* An empty paste (the X11 shape) reads the clipboard once. */
+      let reads = 0;
+      const clipboard = { read: () => (reads++, Promise.resolve([imageItem])) };
+      const calls = [];
+      const { document } = load({
+        navigator: { platform: 'Linux x86_64', clipboard },
+        onInvoke: contentCommand(calls, { files: [], image: null })
+      });
+      const box = target();
+      fire(document, 'paste', paste([], { target: box }));
+      await settle();
+      check('an empty paste falls through to the async clipboard',
+        reads === 1 && box.received.length === 1, `${reads} reads, ${box.received.length} replays`);
+    }
+    {
+      /* The dropped-files event: bytes come from dropped_file, the paste
+       * lands where the pointer was last seen. */
+      const box = target();
+      const calls = [];
+      const { document, eventHandlers } = load({
+        navigator: { platform: 'Linux x86_64', clipboard: clipboardWith([]) },
+        onInvoke: contentCommand(calls),
+        dom: { elementFromPoint: () => box }
+      });
+      fire(document, 'dragover', { isTrusted: true, clientX: 10, clientY: 20 });
+      fire(document, 'drop', {
+        isTrusted: true,
+        dataTransfer: { types: ['text/uri-list', 'text/html'] },
+        preventDefault: () => {},
+        stopPropagation: () => {}
+      });
+      const deliver = (eventHandlers['dropped-files'] || [])[0];
+      check('listens for the dropped-files event', !!deliver);
+      await deliver({ payload: [{ token: 'drop-1', name: 'movie.webm', size: 8 }] });
+      await settle();
+      check('replays a drop as a paste at the pointer', box.received.length === 1 &&
+        box.received[0].clipboardData.files[0].name === 'movie.webm',
+        `${box.received.length} replays`);
+      const asked = calls.find((c) => c.command === 'dropped_file');
+      check('serves the drop by token, not by path', !!asked &&
+        asked.args.token === 'drop-1' && asked.args.index === 0);
+    }
+    {
+      /* A dragged link carries text/plain: not ours to swallow. */
+      let prevented = false;
+      const { document } = load({
+        navigator: { platform: 'Linux x86_64' },
+        dom: {}
+      });
+      fire(document, 'drop', {
+        isTrusted: true,
+        dataTransfer: { types: ['text/uri-list', 'text/plain'] },
+        preventDefault: () => (prevented = true),
+        stopPropagation: () => {}
+      });
+      check('leaves a dropped link alone', !prevented);
     }
     {
       let reads = 0;
       const clipboard = { read: () => (reads++, Promise.resolve([imageItem])) };
       const { document } = load({ navigator: { platform: 'Linux x86_64', clipboard } });
+      // Text is Chat's to handle; an event carrying files needs no replay; an
+      // untrusted event is the replay itself. None of the three may re-read.
       fire(document, 'paste', paste(['text/plain'], { target: target() }));
       fire(document, 'paste', paste([], { target: target(), isTrusted: false }));
+      fire(document, 'paste', { isTrusted: true, clipboardData: { types: ['Files'], files: [{}] }, target: target() });
       await settle();
-      check('leaves a paste that already has something in it alone', reads === 0, `${reads} reads`);
+      check('leaves text pastes, file pastes and its own replay alone', reads === 0, `${reads} reads`);
     }
     {
       const box = target();
@@ -832,27 +1046,31 @@ async function rest() {
     }
     {
       const box = target();
-      const { document, calls } = load({
+      const calls = [];
+      const { document, calls: _ } = load({
         navigator: {
           platform: 'Linux x86_64',
           clipboard: clipboardWith([{ types: ['text/plain'], getType: () => Promise.resolve({}) }])
-        }
+        },
+        onInvoke: contentCommand(calls, { files: [], image: null })
       });
       fire(document, 'paste', paste([], { target: box }));
       await settle();
-      check('does nothing when there is no image to be had', box.received.length === 0 &&
-        !calls.some((c) => c.command === 'page_log' && /image paste/.test(c.args.message)));
+      check('does nothing when there is nothing to be had', box.received.length === 0 &&
+        !calls.some((c) => c.command === 'page_log' && /file paste/.test(c.args.message)));
     }
     {
       const refusal = Object.assign(new Error('the clipboard holds a secret'), { name: 'NotAllowedError' });
-      const { document, calls } = load({
-        navigator: { platform: 'Linux x86_64', clipboard: { read: () => Promise.reject(refusal) } }
+      const calls = [];
+      const { document, calls: __ } = load({
+        navigator: { platform: 'Linux x86_64', clipboard: { read: () => Promise.reject(refusal) } },
+        onInvoke: contentCommand(calls, { files: [], image: null })
       });
       fire(document, 'paste', paste([], { target: target() }));
       await settle();
       const warned = calls.find((c) => c.command === 'page_log' && c.args.level === 'warn');
       check('reports a refused read by name only', !!warned &&
-        warned.args.message === 'image paste: clipboard unreadable: NotAllowedError',
+        warned.args.message === 'file paste: clipboard unreadable: NotAllowedError',
         warned && warned.args.message);
     }
     {

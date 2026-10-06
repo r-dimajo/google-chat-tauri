@@ -145,6 +145,8 @@ pub fn run() {
             commands::open_external_url,
             commands::show_notification,
             commands::menu_action,
+            commands::clipboard_content,
+            commands::dropped_file,
         ])
         .on_menu_event(|app, event| features::app_menu::handle(app, event.id.as_ref()))
         .setup(|app| {
@@ -179,6 +181,12 @@ pub fn run() {
             // `features::media`.
             #[cfg(target_os = "linux")]
             features::media::install(&window);
+
+            // The webview's dropped files never reach the page as files; the
+            // GTK drag data is read here and offered back as an event. See
+            // `features::dnd`.
+            #[cfg(target_os = "linux")]
+            features::dnd::install(handle, &window);
 
             if prefs.zoom != 1.0 {
                 let _ = window.set_zoom(prefs.zoom);

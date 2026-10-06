@@ -88,14 +88,25 @@ something that is not open.
 It is injected twice: once at document start, and again from `on_page_load` as a fallback. Anything that appends,
 increments or registers unconditionally will do so twice.
 
-### `chat.js` pastes an image a second time (Linux only)
+### `chat.js` pastes a second time (Linux only)
 
-WebKitGTK leaves an image out of the paste event — `clipboardData` arrives empty — so Chat, which reads a pasted image
-from the event and nowhere else, does nothing on Ctrl+V. The image is still readable through `navigator.clipboard.read()`
-from inside that same event, so when a *trusted* paste arrives with no types at all, `chat.js` reads it that way and
-dispatches a second paste event carrying it as a file. Chat takes the replay although it is untrusted. Do not widen the
-condition: a paste with anything in it is left alone, and the replay itself is untrusted and not empty, which is what
-keeps it from looping. Kept off macOS because WKWebView answers the same read with a "Paste" callout of its own.
+WebKitGTK leaves files out of the paste event — `clipboardData` carries strings only (see Notes.md for both
+measurements) — so Chat, which reads a pasted *file* from the event and nowhere else, does nothing on Ctrl+V.
+`chat.js` therefore dispatches a second paste event with the files in hand: fetched through `clipboard_file` when the
+event carries a `text/uri-list` (a file-manager copy), or read from `navigator.clipboard.read()` when it carries no
+types at all (a copied image, the X11 shape). Chat takes the replay although it is untrusted. The replay only fires
+for those two shapes: text and `text/html` pastes are Chat's to handle, and replaying over them would double them.
+
+`clipboard_file` is the one command that hands the page file contents, and it is bounded rather than trusted: the ACL
+limits it to the Chat origins, and the handler re-checks the page the window is showing, refuses any URI that is not
+currently on the system clipboard's own uri-list (so a made-up path reads nothing), caps each file at 100 MB and the
+clipboard at 16 files, and logs every refusal. What the page can reach is exactly what the user last copied — the
+same thing a Ctrl+V reaches in any browser.
+
+The drag half needs no code here: Tauri installs its own GTK drag controller by default, which eats the drop before
+WebKit can turn it into a DOM event, so the builder calls `disable_drag_drop_handler()`. This app listens to none of
+Tauri's DnD events, so nothing is given up. Kept off macOS — there, neither the paste nor the drop is known to drop
+anything, and WKWebView answers a page-side clipboard read with a "Paste" callout of its own.
 
 ### `features::media` answers WebKit's permission requests itself (Linux only)
 

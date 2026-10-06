@@ -7,6 +7,9 @@
 # identifier (app permissions are not namespaced).
 #
 # Keep this list minimal: anything here is callable by a page we do not control.
+# `clipboard_content` and `dropped_file` are the two commands that hand over
+# file contents; see `features::clipboard` and `features::dnd` for what bounds
+# them.
 
 [[permission]]
 identifier = "chat-ipc"
@@ -17,4 +20,6 @@ commands.allow = [
   "open_external_url",
   "show_notification",
   "menu_action",
+  "clipboard_content",
+  "dropped_file",
 ]

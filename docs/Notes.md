@@ -70,12 +70,20 @@ later, and one of these was wrong for exactly that reason.
   Workarounds) brought the same loop to 70 s, and it is the relayouts that remain, not the writes — a rate limit on the
   requests would not have touched it, because each call was already waiting 1.2 s for the relayout it had just asked
   for.
-- **WebKitGTK drops images from the paste event.** Measured on Mint 22.3 / WebKitGTK 2.52.6, in the signed-in app and in
-  a bare WebKitGTK view with wry's settings, pasting a PNG that was verifiably on the clipboard: the event fires, and
-  `clipboardData` has no types, no items and no files. Text arrives normally. The result is the same whichever process
-  owns the clipboard and whether or not `javascript-can-access-clipboard` is on. `navigator.clipboard.read()` called from
-  inside a real Ctrl+V returns the image as `image/png` without any permission prompt; called with no user gesture it is
-  refused with `NotAllowedError`.
+- **WebKitGTK drops everything but strings from the paste and drop events.** Measured on Mint 22.3 / WebKitGTK 2.52.6,
+  in the signed-in app and in a bare WebKitGTK view with wry's settings, pasting a PNG that was verifiably on the
+  clipboard: the event fires, and `clipboardData` has no types, no items and no files. Text arrives normally. The
+  result is the same whichever process owns the clipboard and whether or not `javascript-can-access-clipboard` is on.
+  `navigator.clipboard.read()` called from inside a real Ctrl+V returns the image as `image/png` without any permission
+  prompt; called with no user gesture it is refused with `NotAllowedError`.
+- **On Wayland the paste event is not empty — it carries the file as a URL string.** Measured on Ubuntu 26.04 /
+  WebKitGTK 2.52.6 / Wayland with the probe (`features::paste_probe`, debug builds, `GOOGLE_CHAT_PASTE_PROBE=1`),
+  real gestures in the signed-in app: an image copied from Chrome arrives as `text/html` only (an `<img src>` — Chat
+  starts its upload animation, then the fetch dies); a file copied from Dolphin arrives as `text/uri-list` only
+  (`file://` URIs); `files` is empty in every event, either source. No `drop` event ever fires for a drag from Dolphin
+  — 118 `dragover`, 0 `drop` — because Tauri installs its own GTK drag controller on the webview by default
+  (`drag_drop_handler_enabled`), which consumes the gesture before WebKit synthesizes the DOM event. This app listens
+  to none of Tauri's DnD events, so `disable_drag_drop_handler()` costs nothing and gives the page real drops.
 - **The camera and mic are refused until the host says yes.** WebKitGTK routes `getUserMedia` through
   `permission-request`, and wry 0.55 connects nothing to it. Measured in the app: `enumerateDevices` listed the devices,
   `getUserMedia` failed at once with `NotAllowedError` and no prompt; with the request allowed, both tracks opened and

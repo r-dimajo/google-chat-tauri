@@ -1566,7 +1566,9 @@ dependencies = [
 name = "google-chat-tauri"
 version = "1.1.4"
 dependencies = [
+ "base64 0.22.1",
  "dirs 7.0.0",
+ "gtk",
  "log",
  "notify-rust",
  "percent-encoding",
@@ -1583,6 +1585,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tauri-plugin-window-state",
+ "tokio",
  "tray-icon",
  "ureq",
  "url",

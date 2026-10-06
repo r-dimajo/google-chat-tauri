@@ -110,6 +110,30 @@ pub fn show_notification(app: AppHandle, id: u32, title: String, body: Option<St
     crate::features::notifications::show(&app, id, &title, body.as_deref());
 }
 
+/// Backs the paste replay in `chat.js`; see `features::clipboard`.
+///
+/// Async so it runs off the main thread: the GTK clipboard reads are
+/// dispatched there and the file reads happen on workers -- see the module
+/// note for the threading.
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub async fn clipboard_content(
+    app: AppHandle,
+) -> Result<Option<crate::features::clipboard::ClipboardContent>, String> {
+    crate::features::clipboard::read(app).await.map(Some)
+}
+
+/// Backs the drop replay in `chat.js`; see `features::dnd`.
+#[cfg(target_os = "linux")]
+#[tauri::command]
+pub async fn dropped_file(
+    app: AppHandle,
+    token: String,
+    index: usize,
+) -> Result<Option<crate::features::clipboard::ClipboardFile>, String> {
+    crate::features::dnd::dropped_file(app, token, index).await
+}
+
 /// Keyboard shortcuts, forwarded from `chat.js`.
 ///
 /// Not needed on Linux, where GTK delivers the menu accelerator itself and

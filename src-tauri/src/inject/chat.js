@@ -475,68 +475,250 @@
     );
   }
 
-  /* ---------------------------------------------------------- image paste */
-  /* WebKitGTK leaves images out of the paste event. Measured on Mint 22.3 /
-   * WebKitGTK 2.52.6 in the signed-in app, pasting a screenshot: the event
-   * fires, but its clipboardData has no types, no items and no files -- while
-   * `navigator.clipboard.read()` from inside that same event returns the image
-   * as image/png. Text arrives in the event as it should. Chat reads a pasted
-   * image from the event and nowhere else, so Ctrl+V did nothing at all.
+  /* ------------------------------------------------ paste and file drop */
+  /* WebKitGTK leaves everything but strings out of the paste and drop
+   * events. Measured twice in the signed-in app, with the probe in
+   * `features::paste_probe`:
    *
-   * So when a real paste arrives empty, read the clipboard the other way and
-   * paste again with the image in hand. Chat accepts the replay although it is
-   * not trusted -- measured: it calls preventDefault on it, the image lands in
-   * the draft, and it sends.
+   * Mint 22.3 / X11 / WebKitGTK 2.52.6, pasting a screenshot: the event fires
+   * but its clipboardData has no types at all, while `navigator.clipboard.read()`
+   * from inside that same event returns the image as image/png.
    *
-   * Linux only. The read needs no permission there, because the keypress is
-   * the user gesture; WKWebView answers the same read with a "Paste" callout of
-   * its own, and neither it nor WebView2 is known to drop images from the
-   * event. `navigator.platform` is the real platform -- the user agent is
-   * spoofed, this is not. */
+   * Ubuntu 26.04 / Wayland / WebKitGTK 2.52.6: an image copied from Chrome
+   * pastes as `text/html` only (an <img src>; Chat fetches it and the fetch
+   * dies), a file copied or dragged from Dolphin arrives as `text/uri-list`
+   * only, and `files` is empty in every event, either source. `getData` on
+   * the uri-list answers with an empty string, so the page cannot even read
+   * what was copied. No `drop` fires at all while Tauri's own GTK drag
+   * controller is installed -- disabled, see `features::window`.
+   *
+   * In every case Chat reads a pasted or dropped *file* from the event and
+   * nowhere else, so none of it works.
+   *
+   * The answers live on the other side of the IPC, where the real clipboard
+   * and the real drag data still are:
+   *
+   * `clipboard_content` reads the system clipboard -- the uri-list becomes
+   * files, the image/png target becomes one file -- and asks for nothing
+   * from the page, so what the page can reach is exactly what the user last
+   * copied. `dropped-files` (an event from `features::dnd`, which reads the
+   * GTK drag data) carries a token per dropped file; `dropped_file` turns a
+   * token into bytes. Neither hands over a path the user did not just put
+   * there.
+   *
+   * The replay: a second paste event with the files in hand. Chat accepts it
+   * although it is not trusted -- measured: it calls preventDefault on it,
+   * the files land in the draft, and it sends. The original paste or drop is
+   * prevented first, synchronously, or Chat also runs its own broken path on
+   * the string types (the spinner that never ends is Chat fetching an <img>
+   * from the html).
+   *
+   * Linux only. WKWebView answers a page-side clipboard read with a "Paste"
+   * callout of its own, and neither it nor WebView2 is known to drop files
+   * from these events. `navigator.platform` is the real platform -- the user
+   * agent is spoofed, this is not. */
 
   const onLinux = /Linux/.test(navigator.platform);
 
-  async function replayImagePaste(target) {
+  /* Read a string out of a paste or drop event, best-effort.
+   *
+   * getData is synchronous while the event is being dispatched, and answers
+   * '' for types WebKit does not carry over -- which is the whole reason this
+   * section exists. */
+  function readType(dataTransfer, type) {
     try {
-      for (const item of await navigator.clipboard.read()) {
-        const type = item.types.find((t) => t.startsWith('image/'));
-        if (!type) continue;
-
-        const blob = await item.getType(type);
-        const data = new DataTransfer();
-        data.items.add(new File([blob], `image.${type.slice(6).split('+')[0]}`, { type }));
-
-        // The clipboard is read asynchronously, and Chat can re-render the
-        // compose box meanwhile; aim at wherever the caret went if so.
-        const at = target.isConnected ? target : document.activeElement || document.body;
-        const replay = new ClipboardEvent('paste', {
-          clipboardData: data,
-          bubbles: true,
-          cancelable: true
-        });
-        const handled = !at.dispatchEvent(replay);
-        log('debug', `image paste: replayed ${type}, ${blob.size} bytes, handled=${handled}`);
-        return;
-      }
+      return dataTransfer.getData(type) || '';
     } catch (err) {
-      log('warn', `image paste: clipboard unreadable: ${err.name}`);
+      return '';
     }
   }
 
-  function installImagePaste() {
-    if (!onLinux || !navigator.clipboard || !navigator.clipboard.read) return;
+  /* Turn a command answer into a File. */
+  function fileFrom(entry) {
+    try {
+      const bytes = Uint8Array.from(atob(entry.base64), (c) => c.charCodeAt(0));
+      if (!bytes.length) return null;
+      return new File([bytes], entry.name, { type: entry.mime });
+    } catch (err) {
+      return null;
+    }
+  }
+
+  /* Ask the app what the clipboard holds, as files. */
+  async function clipboardFiles() {
+    try {
+      const content = await invoke('clipboard_content');
+      if (!content) return [];
+      const files = (content.files || []).map(fileFrom).filter(Boolean);
+      if (!files.length && content.image) {
+        const image = fileFrom(content.image);
+        if (image) files.push(image);
+      }
+      return files;
+    } catch (err) {
+      log('warn', `file paste: clipboard refused: ${err && err.message ? err.message : 'unknown'}`);
+      return [];
+    }
+  }
+
+  function pasteFiles(target, files) {
+    const data = new DataTransfer();
+    for (const file of files) data.items.add(file);
+
+    // The clipboard is read asynchronously, and Chat can re-render the compose
+    // box meanwhile; aim at wherever the caret went if so.
+    const at = target.isConnected ? target : document.activeElement || document.body;
+    const replay = new ClipboardEvent('paste', {
+      clipboardData: data,
+      bubbles: true,
+      cancelable: true
+    });
+    const handled = !at.dispatchEvent(replay);
+    log(
+      'debug',
+      `file paste: replayed ${files.map((f) => `${f.type || 'unknown'}, ${f.size} bytes`).join('; ')}, handled=${handled}`
+    );
+    return handled;
+  }
+
+  /* Read the clipboard and replay the paste with whatever it holds. */
+  async function replayClipboard(target) {
+    const files = await clipboardFiles();
+
+    if (!files.length && navigator.clipboard && navigator.clipboard.read) {
+      // Nothing on the GTK side; the async clipboard is measured to carry
+      // images on X11 that the targets above missed. After an await, so this
+      // rides on the gesture's transient activation.
+      try {
+        for (const item of await navigator.clipboard.read()) {
+          const type = item.types.find((t) => !t.startsWith('text/'));
+          if (!type) continue;
+          const blob = await item.getType(type);
+          const name = type.startsWith('image/')
+            ? `image.${type.slice(6).split('+')[0]}`
+            : `file.${type.split('/')[1] || 'bin'}`;
+          const file = new File([blob], name, { type });
+          files.push(file);
+        }
+      } catch (err) {
+        log('warn', `file paste: clipboard unreadable: ${err.name}`);
+      }
+    }
+
+    if (files.length) pasteFiles(target, files);
+  }
+
+  /* Synchronously decide whether a paste is one Chat cannot serve, and stop
+   * it before Chat's own handler sees it. The decisions that need the
+   * clipboard are made after; `preventDefault` must happen here or not at
+   * all. */
+  function installPasteReplay() {
+    if (!onLinux) return;
 
     document.addEventListener(
       'paste',
       (event) => {
-        // Only a real paste with nothing in it. The replay is untrusted, and
-        // it carries the image, so it never comes back through here.
+        // Only a real paste with no files in it. The replay is untrusted, and
+        // it carries the files, so it never comes back through here.
         if (!event.isTrusted || !event.clipboardData) return;
-        if (event.clipboardData.types.length) return;
-        replayImagePaste(event.target);
+        if (event.clipboardData.files.length) return;
+
+        const types = [...event.clipboardData.types];
+
+        // A file-manager copy: uri-list without text/plain. A URL copied from
+        // a browser always carries text/plain, and stays Chat's.
+        if (types.includes('text/uri-list') && !types.includes('text/plain')) {
+          event.preventDefault();
+          replayClipboard(event.target);
+          return;
+        }
+
+        // A copied image on Wayland: html that is only an <img>, no text.
+        // Rich text also carries text/plain and is left alone; so is anything
+        // else -- Chat serves it.
+        if (types.includes('text/html') && !types.includes('text/plain')) {
+          const html = readType(event.clipboardData, 'text/html');
+          if (/^\s*<img[\s>]/i.test(html) || /^\s*<meta[^>]*>\s*<img[\s>]/i.test(html)) {
+            event.preventDefault();
+            replayClipboard(event.target);
+          }
+          return;
+        }
+
+        // No types at all: the X11 shape of a copied image or file.
+        if (!types.length) replayClipboard(event.target);
       },
       true
     );
+  }
+
+  /* The drop half. `features::dnd` reads the GTK drag data and answers with
+   * `dropped-files`; the DOM drop itself is only stopped here, because
+   * WebKit's default is to insert the uri-list as text -- the pasted path
+   * the user saw. */
+
+  /* Where the pointer was last seen dragging, so a drop anywhere in the
+   * window replays into the element under it. */
+  let lastDrag = null;
+
+  function installDropReplay() {
+    if (!onLinux) return;
+
+    document.addEventListener(
+      'dragover',
+      (event) => {
+        if (!event.isTrusted) return;
+        lastDrag = { x: event.clientX, y: event.clientY };
+      },
+      true
+    );
+
+    document.addEventListener(
+      'drop',
+      (event) => {
+        if (!event.isTrusted || !event.dataTransfer) return;
+        const types = [...event.dataTransfer.types];
+        // A file drag pairs a uri-list with no text/plain. A dragged link
+        // carries text/plain and stays WebKit's to insert.
+        if (!types.includes('text/uri-list') || types.includes('text/plain')) return;
+        event.preventDefault();
+        event.stopPropagation();
+      },
+      true
+    );
+
+    // The bridge for the event; `listen` is already in the capability for
+    // notification activations.
+    const listen =
+      window.__TAURI__ && window.__TAURI__.event && window.__TAURI__.event.listen;
+    if (!listen) return;
+
+    listen('dropped-files', async (message) => {
+      const listed = message && message.payload;
+      if (!Array.isArray(listed) || !listed.length) return;
+
+      // Where the pointer was when the drop landed.
+      const at = lastDrag && document.elementFromPoint(lastDrag.x, lastDrag.y);
+      const target = at || document.activeElement || document.body;
+
+      const files = [];
+      for (let index = 0; index < listed.length; index++) {
+        try {
+          const answer = await invoke('dropped_file', {
+            token: listed[index].token,
+            index
+          });
+          if (answer) {
+            const file = fileFrom(answer);
+            if (file) files.push(file);
+          }
+        } catch (err) {
+          log('warn', `file drop: ${err && err.message ? err.message : 'refused'} for ${listed[index].name}`);
+        }
+      }
+
+      if (files.length) pasteFiles(target, files);
+    });
   }
 
   /* ------------------------------------------------------ notifications */
@@ -900,7 +1082,8 @@
     // Chat itself. All of it.
     installLinkPolicy(everyForeignLink);
     installShortcuts();
-    installImagePaste();
+    installPasteReplay();
+    installDropReplay();
     installNotifications();
 
     whenReady(() => {
