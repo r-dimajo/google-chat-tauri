@@ -196,6 +196,12 @@ fn deliver(app: &AppHandle, id: u32, title: &str, body: Option<&str>) {
         // Matches the `Icon=` key in the installed .desktop entry. Falls back to
         // the daemon's default when running unpackaged.
         .icon("google-chat-tauri")
+        // Names the .desktop entry, so the app gets per-app notification
+        // settings instead of an anonymous event. Must match the installed
+        // desktop file (see Workarounds.md).
+        .hint(notify_rust::Hint::DesktopEntry("Google Chat".into()))
+        // The page plays its own sound; without this the daemon adds a second.
+        .hint(notify_rust::Hint::SuppressSound(true))
         // Chat notifications are transient; let the daemon time them out.
         .hint(notify_rust::Hint::Category("im.received".into()));
 

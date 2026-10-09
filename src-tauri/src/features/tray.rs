@@ -35,14 +35,18 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
     }
 
     let separator = PredefinedMenuItem::separator(app)?;
-    // Same dialog the window menu's Help -> About opens; the tray is often the
-    // only part of the app in front of the user.
+    items.push(&separator);
+
+    // ksni renders predefined items other than separators as disabled blanks,
+    // so on Linux About is a regular item -- see `show_about_dialog`.
+    #[cfg(target_os = "linux")]
+    let about = MenuItem::with_id(app, "about", "About", true, None::<&str>)?;
+    #[cfg(not(target_os = "linux"))]
     let about = PredefinedMenuItem::about(
         app,
         Some("About"),
         Some(crate::features::app_menu::about_metadata()),
     )?;
-    items.push(&separator);
     items.push(&about);
     items.push(&quit);
 
@@ -52,12 +56,12 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
         .icon(icons::decode(icons::initial())?)
         .tooltip("Google Chat")
         .menu(&menu)
-        // Windows gets a real click event and toggles directly. Everywhere else
-        // left-click opens the menu, whose first item is Toggle -- Linux tray
-        // backends deliver no click events at all, so a menu is the only option.
-        .show_menu_on_left_click(!cfg!(target_os = "windows"))
+        // Linux clicks need the ksni backend -- see the Cargo.toml note.
+        // macOS keeps the menu-on-left-click convention.
+        .show_menu_on_left_click(cfg!(target_os = "macos"))
         .on_menu_event(|app, event| match event.id.as_ref() {
             "toggle" => toggle_window(app),
+            "about" => show_about_dialog(app),
             "demo-badge" => {
                 // Cheap pseudo-random: good enough to eyeball the icons.
                 let n = (std::time::SystemTime::now()
@@ -86,10 +90,8 @@ pub fn create(app: &AppHandle) -> tauri::Result<()> {
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            // Left-click-to-toggle is Windows-only: Linux tray backends
-            // (AppIndicator) do not deliver click events at all, and on macOS a
-            // left click should open the menu.
-            if !cfg!(target_os = "windows") {
+            // macOS opens the menu on left click; Windows and Linux toggle.
+            if cfg!(target_os = "macos") {
                 return;
             }
             if let TrayIconEvent::Click {
@@ -121,7 +123,6 @@ fn toggle_window(app: &AppHandle) {
     } else {
         visible && focused
     };
-
     if should_hide {
         #[cfg(target_os = "macos")]
         let _ = app.hide();
@@ -130,4 +131,24 @@ fn toggle_window(app: &AppHandle) {
     } else {
         window::show_and_focus(app);
     }
+}
+
+/// The tray's About dialog, Linux-only: the ksni menu snapshot renders the
+/// predefined About as a disabled blank. The window menu keeps muda's full one.
+fn show_about_dialog(app: &AppHandle) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+
+    let text = format!(
+        "Google Chat v{}\n{}\n\n{} · GPL-3.0-only\n{}",
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_DESCRIPTION"),
+        env!("CARGO_PKG_AUTHORS"),
+        env!("CARGO_PKG_REPOSITORY"),
+    );
+
+    app.dialog()
+        .message(text)
+        .title("About Google Chat")
+        .kind(MessageDialogKind::Info)
+        .show(|_| {});
 }

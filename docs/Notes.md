@@ -76,6 +76,15 @@ later, and one of these was wrong for exactly that reason.
   owns the clipboard and whether or not `javascript-can-access-clipboard` is on. `navigator.clipboard.read()` called from
   inside a real Ctrl+V returns the image as `image/png` without any permission prompt; called with no user gesture it is
   refused with `NotAllowedError`.
+- **A file dropped on the window never reaches the page as a file.** Tauri's drag-drop handler is on by default and
+  claims the drop to emit its own event, so the page gets no `drop` at all — on every platform, issue #9. With it
+  disabled, measured on Mint 22.3 / WebKitGTK 2.52.6 dropping an image from Nemo: the page gets `dragenter` and `drop`,
+  but `dataTransfer` holds `files=0` and only `text/uri-list` and `text/html`, so Chat ignores it and the composer
+  pastes the file's path as text. That is a WebKit regression, not ours: since 303828@main
+  `DataTransfer::allowsFileAccess()` is false on every port but Cocoa
+  ([WebKit bug 323277](https://bugs.webkit.org/show_bug.cgi?id=323277), and
+  [320301](https://bugs.webkit.org/show_bug.cgi?id=320301) for the same in Epiphany). Disabling the handler is still
+  what macOS and Windows need; on Linux, attach through the upload button until a WebKitGTK release carries the fix.
 - **The camera and mic are refused until the host says yes.** WebKitGTK routes `getUserMedia` through
   `permission-request`, and wry 0.55 connects nothing to it. Measured in the app: `enumerateDevices` listed the devices,
   `getUserMedia` failed at once with `NotAllowedError` and no prompt; with the request allowed, both tracks opened and
@@ -136,6 +145,8 @@ later, and one of these was wrong for exactly that reason.
   descriptors rather than memory. Everything returned to 44 the moment the tray was cleared — **not a leak**, an
   unbounded cost for being away from the desk while a channel is busy. The realistic trigger is an overnight backlog,
   not a hostile page.
+- **Plasma plays no sound for an anonymous notification.** Its event on Plasma 6 is `Action=Popup` with no `Sound=`;
+  the `desktop-entry` hint fixes it. See Workarounds.md.
 
 ## Keyboard and menus
 
@@ -236,8 +247,8 @@ later, and one of these was wrong for exactly that reason.
   screen. It cannot be borrowed as an unread indicator either: holding *N* notifications open to mean *N* unreads is
   the waiter-thread cost in `features::notifications` by design, and dismissing any one of them would make the number
   wrong.
-- **The Linux tray delivers no click events at all.** `tray-icon`'s GTK backend emits none, so the tray menu is the only
-  way in. Windows toggles on click.
+- **The Linux tray's click events come from tray-icon's ksni backend, not the default one.** libappindicator delivers
+  none; ksni delivers a real `TrayIconEvent` on left click. See Workarounds.md.
 - **A minimised window cannot be deiconified on Cinnamon.** `unminimize()` reaches `gtk_window_deiconify` and the window
   stays iconic however often it is asked — measured, `WM_STATE` never leaves 3. And tao refuses to focus a window it
   still believes is minimised, learning otherwise only when the window manager confirms the deiconify, which is after
@@ -264,7 +275,8 @@ later, and one of these was wrong for exactly that reason.
   services them on the GTK main loop — confirmed under gdb: thread 1 is `ppoll` → `g_main_context_iteration` →
   `gtk_main_iteration_do` → tao's `event_loop.rs`. The page renders in a separate `WebKitWebProcess` and keeps working
   meanwhile, which is why a blocked main thread reads as "the buttons are broken" rather than "the app is busy".
-  `set_unread_count` and the tray menu handler still block it; measure before assuming they are free.
+  `set_unread_count` and the tray menu handler still block it; measure before assuming they are free. KDE Wayland draws
+  its titlebar server-side, so this applies to GNOME only.
 - **arboard cannot use the Wayland clipboard, and it does not matter.** Every launch on GNOME Wayland warns that neither
   `ext-data-control` nor `wlr-data-control` is supported — mutter implements neither — and falls back to X11. **Copy
   Current URL** still lands in a Wayland application's paste buffer, verified by pasting one. Do not go hunting a
@@ -302,3 +314,7 @@ later, and one of these was wrong for exactly that reason.
   `smoke-test.py` and `reset-test.py` pin the app with `GDK_BACKEND=x11`, which on a Wayland session means XWayland;
   they test the X11 path only, and the native Wayland path has to be checked by hand. `smoke-test.py` also runs in a
   sandbox profile, or the developer's own `start_hidden` leaves no window to find and the failure looks identical.
+- **A private session bus stalls startup for 25 seconds.** `dbus-run-session` is the quick way to run the app with no
+  StatusNotifierWatcher, but GTK's application registration waits out a portal proxy on the fresh bus before Tauri
+  reaches `setup` — measured under gdb, `g_application_register` → `g_dbus_proxy_new_sync`, 25s timeout. Give the run
+  a minute; a shorter `timeout` kills it silently, with no log line, before anything under test has run.

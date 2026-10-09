@@ -130,6 +130,13 @@ what is undismissed on the desktop rather than what was delivered — see Notes.
 Linux only raises the window, because Chat gives us nothing to navigate to. The cap is on *concurrent* waiters, so
 slots come back as the user works through the tray — a burst of 60 still gave 48 of them click-through.
 
+### Every notification names its desktop entry and asks for silence
+
+`deliver` sends `desktop-entry: "Google Chat"` and `suppress-sound`. The first unlocks per-app settings (System Settings
+→ Notifications) and must keep matching the installed desktop file's name, which Tauri derives from `productName` — the
+same coupling the badge relies on. The second exists because the page plays its own sound and a daemon sound on top
+delivered two notes per message.
+
 ### The click-waiter thread is named explicitly
 
 Linux gives a new thread the creating thread's name, so the waiter spawned from the worker would inherit
@@ -318,11 +325,29 @@ works for an AppImage, never the deb most people install. This app opens the rel
 It starts with a stdout target *and* a log-directory target already. Adding them with `target()` leaves the defaults in
 place and writes every line twice.
 
+## Tray
+
+### The tray-icon dependency exists only for its `ksni` feature
+
+Click events: libappindicator delivers none, ksni does. Cargo can only turn features on, so a direct dependency is the
+only way to enable it; the app never calls tray-icon.
+
+### The tray's About is a regular item on Linux
+
+The ksni menu snapshot renders predefined items (except separators) as disabled blanks, so About is an ordinary
+`MenuItem` opening a message dialog. macOS and Windows keep the predefined item.
+
+### A missing tray is not fatal, and closing then minimises
+
+ksni registers with a StatusNotifierWatcher on the session bus and fails outright when there is none — vanilla GNOME
+without the AppIndicator extension, XEmbed-only panels, or an autostart that beats the panel to the bus. tray-icon gives
+no way to ask ksni to wait for one. Without the `match` in `setup` the app would not start at all. With no tray,
+`close_to_tray::hide` minimises instead of hiding and `--hidden` is ignored, since a hidden window with no tray has no
+way back.
+
 ## Deliberately not built
 
-Auto-update that installs itself; a spellchecker toggle, for which Tauri exposes no API; and single-click tray toggle on
-Linux — the GTK tray backend emits no click events at all, so that would mean replacing Tauri's tray with a direct
-StatusNotifierItem backend, a parallel implementation judged not worth it. Left-click opens the menu, with Toggle first.
+Auto-update that installs itself, and a spellchecker toggle, for which Tauri exposes no API.
 
 Attachment links open in the system browser, which works. `on_download` would keep them in-app: one line in
 `urls::is_in_app`.

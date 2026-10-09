@@ -16,7 +16,9 @@ pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
     WebviewWindowBuilder::new(app, MAIN, WebviewUrl::External(url))
         .title("Google Chat")
         .inner_size(800.0, 600.0)
-        .min_inner_size(480.0, 570.0)
+        // Logical pixels, so the floor grows with display scaling. 400 lets the
+        // whole window fit 540px on a 1080p screen, frame included.
+        .min_inner_size(480.0, 400.0)
         .center()
         // Shown by the caller once setup is done, mirroring electron's
         // `show: false` + `ready-to-show`.
@@ -29,6 +31,12 @@ pub fn create(app: &AppHandle) -> tauri::Result<WebviewWindow> {
         // Zoom is handled in chat.js instead, so the level can be persisted;
         // wry's built-in hotkeys would bypass that.
         .zoom_hotkeys_enabled(false)
+        // Tauri's native handler claims every file drop to emit its own event,
+        // so the page never sees one and dropping a file on a conversation
+        // does nothing. Nothing here listens for that event; Chat's own drop
+        // zone is the one that should get it. On Linux the drop then reaches
+        // the page without its file, a WebKitGTK bug -- see Notes.
+        .disable_drag_drop_handler()
         .user_agent(&crate::features::user_agent::spoofed())
         .initialization_script(crate::inject::SCRIPT)
         .on_navigation(crate::features::external_links::navigation_guard)
